@@ -1,0 +1,10 @@
+mojo-embree includes a Mojo port of selected algorithms from Intel Embree.
+
+Embree
+Copyright 2009-2021 Intel Corporation
+https://github.com/RenderKit/embree
+Licensed under the Apache License, Version 2.0.
+
+The ported source files are identified in provenance comments in
+src/embree.mojo. mojo-embree's own original portions remain under the MIT
+License in LICENSE.
