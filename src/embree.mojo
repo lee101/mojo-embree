@@ -1,6 +1,8 @@
 """Embree-derived float32 BVH construction and ray traversal kernels."""
 
+from max.algorithm import parallelize
 from std.math import abs, iota
+from std.runtime import initialize_runtime
 from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
 
 comptime F32Ptr = UnsafePointer[Float32, AnyOrigin[mut=True]]
@@ -13,7 +15,7 @@ comptime MAX_WORKERS = 32
 comptime PARALLEL_THRESHOLD = 4_096
 comptime BUILD_PREPROCESS_PARALLEL_THRESHOLD = 1_000_000
 comptime BUILD_PREPROCESS_MAX_WORKERS = 8
-comptime BUILD_PARALLEL_THRESHOLD = 262_144
+comptime BUILD_PARALLEL_THRESHOLD = 8_192
 comptime BUILD_MAX_WORKERS = 4
 comptime LARGE = Float32(3.402823466e38)
 comptime ULP = Float32(1.1920928955078125e-7)
@@ -57,6 +59,30 @@ def half_area(
 def bin_index(center: Float32, offset: Float32, scale: Float32, count: Int) -> Int:
     var index = Int((center - offset) * scale)
     return max(0, min(count - 1, index))
+
+
+@always_inline
+def extend_bin(
+    bin_bounds: F32Ptr,
+    bin_counts: I32Ptr,
+    bin: Int,
+    dim: Int,
+    lx: Float32,
+    ly: Float32,
+    lz: Float32,
+    ux: Float32,
+    uy: Float32,
+    uz: Float32,
+):
+    var index = bin * 3 + dim
+    bin_counts[index] += 1
+    var bb = index * 6
+    bin_bounds[bb] = min(bin_bounds[bb], lx)
+    bin_bounds[bb + 1] = min(bin_bounds[bb + 1], ly)
+    bin_bounds[bb + 2] = min(bin_bounds[bb + 2], lz)
+    bin_bounds[bb + 3] = max(bin_bounds[bb + 3], ux)
+    bin_bounds[bb + 4] = max(bin_bounds[bb + 4], uy)
+    bin_bounds[bb + 5] = max(bin_bounds[bb + 5], uz)
 
 
 @always_inline
@@ -148,8 +174,7 @@ def precompute_bounds(
                 triangles, primitive_bounds, primitive_count, begin, end
             )
 
-        for task in range(tasks):
-            process_chunk(task)
+        parallelize[process_chunk](tasks, tasks)
     else:
         precompute_bounds_chunk(
             triangles, primitive_bounds, primitive_count, 0, primitive_count
@@ -296,7 +321,7 @@ def build_subtree(
         if dz > CENTROID_EPS:
             sz = Float32(0.99) * Float32(num_bins) / dz
 
-        for index in range(MAX_BINS * 3):
+        for index in range(num_bins * 3):
             bin_counts[index] = 0
             var bb = index * 6
             bin_bounds[bb] = LARGE
@@ -317,21 +342,9 @@ def build_subtree(
             var ix = bin_index(lx + ux, clx, sx, num_bins)
             var iy = bin_index(ly + uy, cly, sy, num_bins)
             var iz = bin_index(lz + uz, clz, sz, num_bins)
-            for dim in range(3):
-                var bin = ix
-                if dim == 1:
-                    bin = iy
-                elif dim == 2:
-                    bin = iz
-                var index = bin * 3 + dim
-                bin_counts[index] += 1
-                var bb = index * 6
-                bin_bounds[bb] = min(bin_bounds[bb], lx)
-                bin_bounds[bb + 1] = min(bin_bounds[bb + 1], ly)
-                bin_bounds[bb + 2] = min(bin_bounds[bb + 2], lz)
-                bin_bounds[bb + 3] = max(bin_bounds[bb + 3], ux)
-                bin_bounds[bb + 4] = max(bin_bounds[bb + 4], uy)
-                bin_bounds[bb + 5] = max(bin_bounds[bb + 5], uz)
+            extend_bin(bin_bounds, bin_counts, ix, 0, lx, ly, lz, ux, uy, uz)
+            extend_bin(bin_bounds, bin_counts, iy, 1, lx, ly, lz, ux, uy, uz)
+            extend_bin(bin_bounds, bin_counts, iz, 2, lx, ly, lz, ux, uy, uz)
 
         var best_sah = LARGE
         var best_dim = -1
@@ -611,8 +624,7 @@ def build_binned_sah(
         )
         right_counts[task * MAX_BINS] = Int32(local_nodes)
 
-    for task in range(frontier_count):
-        build_frontier(task)
+    parallelize[build_frontier](frontier_count, frontier_count)
 
     var compact_node = top_node_count
     var source_node = top_node_count
@@ -727,6 +739,7 @@ def intersect_triangle(
     ray_near: Float32,
     ray_far: Float32,
     accept_equal_far: Bool,
+    write_hit: Bool,
     hit_u: F32Ptr,
     hit_v: F32Ptr,
     hit_ng: F32Ptr,
@@ -805,15 +818,16 @@ def intersect_triangle(
     ):
         return LARGE
 
-    var reciprocal_uvw = Float32(0.0)
-    if abs(uvw) >= MIN_RCP_INPUT:
-        reciprocal_uvw = Float32(1.0) / uvw
-    hit_u[ray_index] = min(u * reciprocal_uvw, Float32(1.0))
-    hit_v[ray_index] = min(v * reciprocal_uvw, Float32(1.0))
-    var ng_base = ray_index * 3
-    hit_ng[ng_base] = ngx
-    hit_ng[ng_base + 1] = ngy
-    hit_ng[ng_base + 2] = ngz
+    if write_hit:
+        var reciprocal_uvw = Float32(0.0)
+        if abs(uvw) >= MIN_RCP_INPUT:
+            reciprocal_uvw = Float32(1.0) / uvw
+        hit_u[ray_index] = min(u * reciprocal_uvw, Float32(1.0))
+        hit_v[ray_index] = min(v * reciprocal_uvw, Float32(1.0))
+        var ng_base = ray_index * 3
+        hit_ng[ng_base] = ngx
+        hit_ng[ng_base + 1] = ngy
+        hit_ng[ng_base + 2] = ngz
     return distance
 
 
@@ -882,6 +896,7 @@ def trace_one(
                     ray_near,
                     closest,
                     closest_id < 0,
+                    True,
                     hit_u,
                     hit_v,
                     hit_ng,
@@ -907,8 +922,8 @@ def trace_one(
                     for primitive in range(primitive_count):
                         var distance = intersect_triangle(
                             triangles, primitive, ox, oy, oz, dx, dy, dz,
-                            ray_near, closest, closest_id < 0, hit_u, hit_v,
-                            hit_ng, ray_index,
+                            ray_near, closest, closest_id < 0, True, hit_u,
+                            hit_v, hit_ng, ray_index,
                         )
                         if distance != LARGE:
                             closest = distance
@@ -945,9 +960,6 @@ def occluded_one(
     ray_nears: F32Ptr,
     ray_fars: F32Ptr,
     occluded: U8Ptr,
-    scratch_u: F32Ptr,
-    scratch_v: F32Ptr,
-    scratch_ng: F32Ptr,
     primitive_count: Int,
     ray_index: Int,
 ):
@@ -991,9 +1003,10 @@ def occluded_one(
                     ray_near,
                     ray_far,
                     True,
-                    scratch_u,
-                    scratch_v,
-                    scratch_ng,
+                    False,
+                    triangles,
+                    triangles,
+                    triangles,
                     ray_index,
                 )
                 if distance != LARGE:
@@ -1004,8 +1017,8 @@ def occluded_one(
                 for primitive in range(primitive_count):
                     if intersect_triangle(
                         triangles, primitive, ox, oy, oz, dx, dy, dz,
-                        ray_near, ray_far, True, scratch_u, scratch_v,
-                        scratch_ng, ray_index,
+                        ray_near, ray_far, True, False, triangles, triangles,
+                        triangles, ray_index,
                     ) != LARGE:
                         occluded[ray_index] = 1
                         return
@@ -1029,6 +1042,7 @@ def me_build_bvh(
     right_bounds_address: Int,
     right_counts_address: Int,
 ) abi("C") -> Int:
+    initialize_runtime()
     return build_binned_sah(
         fp(triangles_address),
         fp(primitive_bounds_address),
@@ -1063,6 +1077,7 @@ def me_intersect_stream(
     primitive_count: Int,
     ray_count: Int,
 ) abi("C"):
+    initialize_runtime()
     if ray_count <= 0:
         return
     var triangles = fp(triangles_address)
@@ -1128,8 +1143,7 @@ def me_intersect_stream(
                     ray,
                 )
 
-        for task in range(tasks):
-            process_chunk(task)
+        parallelize[process_chunk](tasks, tasks)
     else:
         for ray in range(ray_count):
             trace_one(
@@ -1164,12 +1178,10 @@ def me_occluded_stream(
     ray_fars_address: Int,
     occluded_address: Int,
     traversal_stacks_address: Int,
-    scratch_u_address: Int,
-    scratch_v_address: Int,
-    scratch_ng_address: Int,
     primitive_count: Int,
     ray_count: Int,
 ) abi("C"):
+    initialize_runtime()
     if ray_count <= 0:
         return
     var triangles = fp(triangles_address)
@@ -1182,9 +1194,6 @@ def me_occluded_stream(
     var ray_fars = fp(ray_fars_address)
     var result = bp(occluded_address)
     var traversal_stacks = ip(traversal_stacks_address)
-    var scratch_u = fp(scratch_u_address)
-    var scratch_v = fp(scratch_v_address)
-    var scratch_ng = fp(scratch_ng_address)
     var tasks = 1
     if ray_count >= PARALLEL_THRESHOLD:
         tasks = min(MAX_WORKERS, min(num_physical_cores(), max(1, ray_count // 1024)))
@@ -1202,9 +1211,6 @@ def me_occluded_stream(
             ray_nears,
             ray_fars,
             result,
-            scratch_u,
-            scratch_v,
-            scratch_ng,
             primitive_count,
             ray_count,
             tasks,
@@ -1225,15 +1231,11 @@ def me_occluded_stream(
                     ray_nears,
                     ray_fars,
                     result,
-                    scratch_u,
-                    scratch_v,
-                    scratch_ng,
                     primitive_count,
                     ray,
                 )
 
-        for task in range(tasks):
-            process_chunk(task)
+        parallelize[process_chunk](tasks, tasks)
     else:
         for ray in range(ray_count):
             occluded_one(
@@ -1247,9 +1249,6 @@ def me_occluded_stream(
                 ray_nears,
                 ray_fars,
                 result,
-                scratch_u,
-                scratch_v,
-                scratch_ng,
                 primitive_count,
                 ray,
             )

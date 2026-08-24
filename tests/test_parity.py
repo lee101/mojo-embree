@@ -120,6 +120,7 @@ def test_parallel_stream_and_occlusion_match_embree():
     far = np.full(len(origins), np.inf, dtype=np.float32)
     expected_occluded = reference.occluded(origins, directions, near, far)
     reference.close()
+    assert actual_occluded.dtype == np.bool_
     np.testing.assert_array_equal(actual_occluded, expected_occluded)
     np.testing.assert_array_equal(hits.hit, actual_occluded)
 
@@ -199,7 +200,7 @@ def test_simd_tail_and_serial_build_threshold():
 
 
 def test_parallel_build_threshold_and_node_compaction():
-    count = 262_147
+    count = 8_195
     triangle = np.array(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32
     )

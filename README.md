@@ -120,17 +120,19 @@ neither side pays a per-ray Python call.
 
 | case | mojo-embree | Embree 4.4.1 | relative |
 |---|---:|---:|---:|
-| BVH build, 32,768 triangles | 40.46 ms | 5.82 ms | 6.95x slower |
-| closest-hit stream, 100,000 rays | 16.01 ms | 28.64 ms | 1.79x faster |
-| occlusion stream, 100,000 rays | 13.41 ms | 16.38 ms | 1.22x faster |
+| BVH build, 32,768 triangles | 20.67 ms | 5.57 ms | 3.71x slower |
+| closest-hit stream, 100,000 rays | 5.88 ms | 17.84 ms | 3.03x faster |
+| occlusion stream, 100,000 rays | 5.39 ms | 14.30 ms | 2.66x faster |
 
-Embree's highly optimized parallel wide-node builder is substantially faster
-than this compact binary builder. The Mojo closest-hit stream wins this
-particular large batch by distributing independent rays over up to 32
-physical-core tasks, and the occlusion stream is narrowly ahead. This is not
-a claim that one scalar traversal is faster than Embree.
+Embree's highly optimized parallel wide-node builder remains substantially
+faster than this compact binary builder. The Mojo builder clears only active
+adaptive SAH bins and distributes independent frontier subtrees over four
+workers above 8,192 triangles. The stream kernels distribute large ray batches
+over up to 32 physical-core tasks. This is not a claim that one scalar
+traversal is faster than Embree.
 
-No GPU path is included. The builder targeted here is dominated by bounds
-traffic and random bin updates at well under two arithmetic operations per
-byte moved. The traversal streams are already ahead of the reference in this
-benchmark and were not changed merely to add GPU execution.
+No GPU path is included. The builder is dominated by bounds traffic and random
+bin updates, while traversal has divergent control flow and irregular node and
+triangle reads; both remain below roughly two arithmetic operations per byte
+moved. CPU traversal is also already ahead of the reference in this benchmark,
+so a GPU path would add transfer and launch overhead without a justified target.

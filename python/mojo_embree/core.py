@@ -173,11 +173,18 @@ class BVH:
         ):
             raise ValueError("ray intervals require 0 <= tnear <= tfar")
 
-        hit_ids = np.full(count, -1, dtype=np.int32)
-        hit_t = far_array.copy()
-        hit_u = np.zeros(count, dtype=np.float32)
-        hit_v = np.zeros(count, dtype=np.float32)
-        hit_ng = np.zeros((count, 3), dtype=np.float32)
+        if self.node_count:
+            hit_ids = np.empty(count, dtype=np.int32)
+            hit_t = np.empty(count, dtype=np.float32)
+            hit_u = np.empty(count, dtype=np.float32)
+            hit_v = np.empty(count, dtype=np.float32)
+            hit_ng = np.empty((count, 3), dtype=np.float32)
+        else:
+            hit_ids = np.full(count, -1, dtype=np.int32)
+            hit_t = far_array.copy()
+            hit_u = np.zeros(count, dtype=np.float32)
+            hit_v = np.zeros(count, dtype=np.float32)
+            hit_ng = np.zeros((count, 3), dtype=np.float32)
         if count and self.node_count:
             lib().me_intersect_stream(
                 _address(self.triangles),
@@ -241,10 +248,7 @@ class BVH:
         ):
             raise ValueError("ray intervals require 0 <= tnear <= tfar")
 
-        result = np.zeros(count, dtype=np.uint8)
-        scratch_u = np.empty(count, dtype=np.float32)
-        scratch_v = np.empty(count, dtype=np.float32)
-        scratch_ng = np.empty((count, 3), dtype=np.float32)
+        result = np.zeros(count, dtype=np.bool_)
         if count and self.node_count:
             lib().me_occluded_stream(
                 _address(self.triangles),
@@ -257,10 +261,7 @@ class BVH:
                 _address(far_array),
                 _address(result),
                 _address(self._traversal_stack),
-                _address(scratch_u),
-                    _address(scratch_v),
-                    _address(scratch_ng),
-                    self.primitive_count,
-                    count,
+                self.primitive_count,
+                count,
             )
-        return result.astype(bool)
+        return result
