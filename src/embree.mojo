@@ -1,6 +1,5 @@
 """Embree-derived float32 BVH construction and ray traversal kernels."""
 
-from std.algorithm import parallelize
 from std.math import abs, iota
 from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
 
@@ -149,7 +148,8 @@ def precompute_bounds(
                 triangles, primitive_bounds, primitive_count, begin, end
             )
 
-        parallelize[process_chunk](tasks, tasks)
+        for task in range(tasks):
+            process_chunk(task)
     else:
         precompute_bounds_chunk(
             triangles, primitive_bounds, primitive_count, 0, primitive_count
@@ -611,10 +611,8 @@ def build_binned_sah(
         )
         right_counts[task * MAX_BINS] = Int32(local_nodes)
 
-    if frontier_count > 1:
-        parallelize[build_frontier](frontier_count, frontier_count)
-    else:
-        build_frontier(0)
+    for task in range(frontier_count):
+        build_frontier(task)
 
     var compact_node = top_node_count
     var source_node = top_node_count
@@ -1130,7 +1128,8 @@ def me_intersect_stream(
                     ray,
                 )
 
-        parallelize[process_chunk](tasks, tasks)
+        for task in range(tasks):
+            process_chunk(task)
     else:
         for ray in range(ray_count):
             trace_one(
@@ -1233,7 +1232,8 @@ def me_occluded_stream(
                     ray,
                 )
 
-        parallelize[process_chunk](tasks, tasks)
+        for task in range(tasks):
+            process_chunk(task)
     else:
         for ray in range(ray_count):
             occluded_one(
