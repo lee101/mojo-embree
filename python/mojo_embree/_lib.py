@@ -16,8 +16,8 @@ I = ctypes.c_ssize_t
 
 _SIGNATURES = {
     "me_build_bvh": ([I] * 11, I),
-    "me_intersect_stream": ([I] * 16, None),
-    "me_occluded_stream": ([I] * 12, None),
+    "me_intersect_stream": ([I] * 17, None),
+    "me_occluded_stream": ([I] * 13, None),
     "me_stack_size": ([], I),
 }
 

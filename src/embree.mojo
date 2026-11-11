@@ -1,9 +1,8 @@
 """Embree-derived float32 BVH construction and ray traversal kernels."""
 
-from max.algorithm import parallelize
 from std.math import abs, iota
 from std.runtime import initialize_runtime
-from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
+from std.sys.info import simd_width_of as simdwidthof
 
 comptime F32Ptr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime I32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
@@ -12,9 +11,6 @@ comptime MAX_BINS = 32
 comptime MAX_LEAF_SIZE = 32
 comptime STACK_SIZE = 128
 comptime MAX_WORKERS = 32
-comptime PARALLEL_THRESHOLD = 4_096
-comptime BUILD_PREPROCESS_PARALLEL_THRESHOLD = 1_000_000
-comptime BUILD_PREPROCESS_MAX_WORKERS = 8
 comptime BUILD_PARALLEL_THRESHOLD = 8_192
 comptime BUILD_MAX_WORKERS = 4
 comptime LARGE = Float32(3.402823466e38)
@@ -156,29 +152,12 @@ def precompute_bounds(
     primitive_bounds: F32Ptr,
     primitive_count: Int,
 ):
-    var tasks = 1
-    if primitive_count >= BUILD_PREPROCESS_PARALLEL_THRESHOLD:
-        tasks = min(
-            BUILD_PREPROCESS_MAX_WORKERS,
-            min(num_physical_cores(), max(1, primitive_count // 4_096)),
-        )
-    if tasks > 1:
-
-        @parameter
-        @__copy_capture(triangles, primitive_bounds, primitive_count, tasks)
-        @always_inline
-        def process_chunk(task: Int):
-            var begin = primitive_count * task // tasks
-            var end = primitive_count * (task + 1) // tasks
-            precompute_bounds_chunk(
-                triangles, primitive_bounds, primitive_count, begin, end
-            )
-
-        parallelize[process_chunk](tasks, tasks)
-    else:
-        precompute_bounds_chunk(
-            triangles, primitive_bounds, primitive_count, 0, primitive_count
-        )
+    # Streaming pass over contiguous triangle vertices: 36 bytes read and 24
+    # bytes written per primitive for about a dozen min/max operations, so
+    # ~0.2 flop/byte. Serial.
+    precompute_bounds_chunk(
+        triangles, primitive_bounds, primitive_count, 0, primitive_count
+    )
 
 
 @always_inline
@@ -235,7 +214,7 @@ def build_subtree(
         var vcuz = SIMD[DType.float32, W](-LARGE)
         var slot = begin
         while slot + W <= end:
-            var primitives = primitive_order.load[width=W](slot).cast[DType.int]()
+            var primitives = primitive_order.unsafe_load[width=W](slot).cast[DType.int]()
             var vlx = primitive_bounds.gather(primitives)
             var vly = primitive_bounds.gather(primitive_count + primitives)
             var vlz = primitive_bounds.gather(2 * primitive_count + primitives)
@@ -535,10 +514,7 @@ def build_binned_sah(
         )
         return nodes
 
-    var desired_tasks = min(
-        BUILD_MAX_WORKERS,
-        min(num_physical_cores(), max(2, primitive_count // 2_048)),
-    )
+    var desired_tasks = BUILD_MAX_WORKERS
     var frontier_count = 1
     var frontier_cursor = 0
     build_stack[0] = 0
@@ -580,23 +556,12 @@ def build_binned_sah(
             Int(node_data[data_base + 1]) - Int(node_data[data_base])
         )
 
-    @parameter
-    @__copy_capture(
-        primitive_bounds,
-        primitive_count,
-        node_bounds,
-        node_data,
-        primitive_order,
-        build_stack,
-        bin_bounds,
-        bin_counts,
-        right_bounds,
-        right_counts,
-        frontier_count,
-        top_node_count,
-    )
-    @always_inline
-    def build_frontier(task: Int):
+    # The frontier is capped at BUILD_MAX_WORKERS (4) subtrees, and each
+    # task's node region and bin scratch are laid out by index, so the loop
+    # is inlined serially. The compaction pass below is globally sequential
+    # (it renumbers every child reference), which is why this cannot be
+    # lifted to a range-taking entry point either.
+    for task in range(frontier_count):
         var stack_offset = 2 * BUILD_MAX_WORKERS
         var node_region = top_node_count
         for previous in range(task):
@@ -624,8 +589,6 @@ def build_binned_sah(
         )
         right_counts[task * MAX_BINS] = Int32(local_nodes)
 
-    parallelize[build_frontier](frontier_count, frontier_count)
-
     var compact_node = top_node_count
     var source_node = top_node_count
     for task in range(frontier_count):
@@ -644,7 +607,7 @@ def build_binned_sah(
             while bound + W <= bound_count:
                 node_bounds.store(
                     compact_bound + bound,
-                    node_bounds.load[width=W](source_bound + bound),
+                    node_bounds.unsafe_load[width=W](source_bound + bound),
                 )
                 bound += W
             while bound < bound_count:
@@ -1075,10 +1038,11 @@ def me_intersect_stream(
     hit_ng_address: Int,
     traversal_stacks_address: Int,
     primitive_count: Int,
-    ray_count: Int,
+    ray_start: Int,
+    ray_stop: Int,
 ) abi("C"):
     initialize_runtime()
-    if ray_count <= 0:
+    if ray_stop <= ray_start:
         return
     var triangles = fp(triangles_address)
     var node_bounds = fp(node_bounds_address)
@@ -1094,13 +1058,14 @@ def me_intersect_stream(
     var hit_v = fp(hit_v_address)
     var hit_ng = fp(hit_ng_address)
     var traversal_stacks = ip(traversal_stacks_address)
-    var tasks = 1
-    if ray_count >= PARALLEL_THRESHOLD:
-        tasks = min(MAX_WORKERS, min(num_physical_cores(), max(1, ray_count // 1024)))
-    if tasks > 1:
-
-        @parameter
-        @__copy_capture(
+    # Each ray is an independent latency-bound walk down the BVH: O(log N)
+    # node tests plus a few triangle tests, all random accesses with no
+    # prefetching, so a single core runs out of outstanding misses long
+    # before it saturates memory. The shim fans this out over a thread pool
+    # and hands each chunk its own traversal stack, so this entry point
+    # covers the ray range [ray_start, ray_stop).
+    for ray in range(ray_start, ray_stop):
+        trace_one(
             triangles,
             node_bounds,
             node_data,
@@ -1116,54 +1081,8 @@ def me_intersect_stream(
             hit_v,
             hit_ng,
             primitive_count,
-            ray_count,
-            tasks,
+            ray,
         )
-        @always_inline
-        def process_chunk(task: Int):
-            var begin = ray_count * task // tasks
-            var end = ray_count * (task + 1) // tasks
-            for ray in range(begin, end):
-                trace_one(
-                    triangles,
-                    node_bounds,
-                    node_data,
-                    primitive_order,
-                    traversal_stacks + task * STACK_SIZE,
-                    origins,
-                    directions,
-                    ray_nears,
-                    ray_fars,
-                    hit_ids,
-                    hit_t,
-                    hit_u,
-                    hit_v,
-                    hit_ng,
-                    primitive_count,
-                    ray,
-                )
-
-        parallelize[process_chunk](tasks, tasks)
-    else:
-        for ray in range(ray_count):
-            trace_one(
-                triangles,
-                node_bounds,
-                node_data,
-                primitive_order,
-                traversal_stacks,
-                origins,
-                directions,
-                ray_nears,
-                ray_fars,
-                hit_ids,
-                hit_t,
-                hit_u,
-                hit_v,
-                hit_ng,
-                primitive_count,
-                ray,
-            )
 
 
 @export("me_occluded_stream")
@@ -1179,10 +1098,11 @@ def me_occluded_stream(
     occluded_address: Int,
     traversal_stacks_address: Int,
     primitive_count: Int,
-    ray_count: Int,
+    ray_start: Int,
+    ray_stop: Int,
 ) abi("C"):
     initialize_runtime()
-    if ray_count <= 0:
+    if ray_stop <= ray_start:
         return
     var triangles = fp(triangles_address)
     var node_bounds = fp(node_bounds_address)
@@ -1194,13 +1114,11 @@ def me_occluded_stream(
     var ray_fars = fp(ray_fars_address)
     var result = bp(occluded_address)
     var traversal_stacks = ip(traversal_stacks_address)
-    var tasks = 1
-    if ray_count >= PARALLEL_THRESHOLD:
-        tasks = min(MAX_WORKERS, min(num_physical_cores(), max(1, ray_count // 1024)))
-    if tasks > 1:
-
-        @parameter
-        @__copy_capture(
+    # Independent any-hit walks, so the same reasoning as me_intersect_stream
+    # applies: the shim splits the ray range and gives each chunk its own
+    # traversal stack.
+    for ray in range(ray_start, ray_stop):
+        occluded_one(
             triangles,
             node_bounds,
             node_data,
@@ -1212,46 +1130,8 @@ def me_occluded_stream(
             ray_fars,
             result,
             primitive_count,
-            ray_count,
-            tasks,
+            ray,
         )
-        @always_inline
-        def process_chunk(task: Int):
-            var begin = ray_count * task // tasks
-            var end = ray_count * (task + 1) // tasks
-            for ray in range(begin, end):
-                occluded_one(
-                    triangles,
-                    node_bounds,
-                    node_data,
-                    primitive_order,
-                    traversal_stacks + task * STACK_SIZE,
-                    origins,
-                    directions,
-                    ray_nears,
-                    ray_fars,
-                    result,
-                    primitive_count,
-                    ray,
-                )
-
-        parallelize[process_chunk](tasks, tasks)
-    else:
-        for ray in range(ray_count):
-            occluded_one(
-                triangles,
-                node_bounds,
-                node_data,
-                primitive_order,
-                traversal_stacks,
-                origins,
-                directions,
-                ray_nears,
-                ray_fars,
-                result,
-                primitive_count,
-                ray,
-            )
 
 
 @export("me_stack_size")

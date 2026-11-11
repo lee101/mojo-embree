@@ -1,7 +1,7 @@
 """Python API for Embree-derived Mojo ray tracing kernels."""
 
 from __future__ import annotations
-
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -13,6 +13,37 @@ FloatArray = NDArray[np.float32]
 IntArray = NDArray[np.int32]
 INT32_MAX = np.iinfo(np.int32).max
 
+RAY_PARALLEL_MIN = 4_096
+RAYS_PER_WORKER = 1_024
+MAX_RAY_WORKERS = 8
+
+
+def _trace_ray_chunks(call, stacks, stack_size, count):
+    """Fan an independent-per-ray traversal out over worker threads.
+
+    Each ray is a latency-bound walk down the BVH with no prefetching, so a
+    single core runs out of outstanding misses before it saturates memory
+    and extra cores add real memory-level parallelism. ctypes drops the GIL
+    for the foreign call, so this is genuine fan-out; every chunk writes a
+    disjoint ray slice and gets its own traversal stack row.
+    """
+    if count < RAY_PARALLEL_MIN:
+        call(stacks, 0, count)
+        return
+    workers = min(MAX_RAY_WORKERS, max(1, -(-count // RAYS_PER_WORKER)))
+    if workers == 1:
+        call(stacks, 0, count)
+        return
+    bounds = [i * count // workers for i in range(workers + 1)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(
+            pool.map(
+                lambda c: call(
+                    stacks + c * stack_size, bounds[c], bounds[c + 1]
+                ),
+                range(workers),
+            )
+        )
 
 def _address(array: np.ndarray) -> int:
     address = int(array.ctypes.data)
@@ -186,23 +217,30 @@ class BVH:
             hit_v = np.zeros(count, dtype=np.float32)
             hit_ng = np.zeros((count, 3), dtype=np.float32)
         if count and self.node_count:
-            lib().me_intersect_stream(
-                _address(self.triangles),
-                _address(self.node_bounds),
-                _address(self.node_data),
-                _address(self.primitive_order),
-                _address(origin_array),
-                _address(direction_array),
-                _address(near_array),
-                _address(far_array),
-                _address(hit_ids),
-                _address(hit_t),
-                _address(hit_u),
-                _address(hit_v),
+            intersect = lib().me_intersect_stream
+            _trace_ray_chunks(
+                lambda stacks, lo, hi: intersect(
+                    _address(self.triangles),
+                    _address(self.node_bounds),
+                    _address(self.node_data),
+                    _address(self.primitive_order),
+                    _address(origin_array),
+                    _address(direction_array),
+                    _address(near_array),
+                    _address(far_array),
+                    _address(hit_ids),
+                    _address(hit_t),
+                    _address(hit_u),
+                    _address(hit_v),
                     _address(hit_ng),
-                    _address(self._traversal_stack),
+                    stacks,
                     self.primitive_count,
-                    count,
+                    lo,
+                    hi,
+                ),
+                _address(self._traversal_stack),
+                self._traversal_stack.strides[0],
+                count,
             )
         return RayHits(hit_ids, hit_t, hit_u, hit_v, hit_ng)
 
@@ -250,18 +288,25 @@ class BVH:
 
         result = np.zeros(count, dtype=np.bool_)
         if count and self.node_count:
-            lib().me_occluded_stream(
-                _address(self.triangles),
-                _address(self.node_bounds),
-                _address(self.node_data),
-                _address(self.primitive_order),
-                _address(origin_array),
-                _address(direction_array),
-                _address(near_array),
-                _address(far_array),
-                _address(result),
+            occluded = lib().me_occluded_stream
+            _trace_ray_chunks(
+                lambda stacks, lo, hi: occluded(
+                    _address(self.triangles),
+                    _address(self.node_bounds),
+                    _address(self.node_data),
+                    _address(self.primitive_order),
+                    _address(origin_array),
+                    _address(direction_array),
+                    _address(near_array),
+                    _address(far_array),
+                    _address(result),
+                    stacks,
+                    self.primitive_count,
+                    lo,
+                    hi,
+                ),
                 _address(self._traversal_stack),
-                self.primitive_count,
+                self._traversal_stack.strides[0],
                 count,
             )
         return result
