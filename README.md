@@ -118,6 +118,10 @@ logical CPUs. Times are the best of three warm runs.
 The reference is conda-forge Embree 4.4.1 called from a compiled C++ loop, so
 neither side pays a per-ray Python call.
 
+The GPU phase did not change `src/embree.mojo`, `python/` or the build
+scripts, so the numbers below are untouched by it. They were not re-taken, and
+no before/after pair is reported, because there is no after to measure.
+
 | case | mojo-embree | Embree 4.4.1 | relative |
 |---|---:|---:|---:|
 | BVH build, 32,768 triangles | 20.67 ms | 5.57 ms | 3.71x slower |
@@ -131,8 +135,33 @@ workers above 8,192 triangles. The stream kernels distribute large ray batches
 over up to 32 physical-core tasks. This is not a claim that one scalar
 traversal is faster than Embree.
 
-No GPU path is included. The builder is dominated by bounds traffic and random
-bin updates, while traversal has divergent control flow and irregular node and
-triangle reads; both remain below roughly two arithmetic operations per byte
-moved. CPU traversal is also already ahead of the reference in this benchmark,
-so a GPU path would add transfer and launch overhead without a justified target.
+No GPU path is included. `bench/analysis.md` records the gate: every kernel is
+below roughly two arithmetic operations per byte moved, so none is compute-heavy
+enough to pay for a device transfer and launch.
+
+| kernel | flops/byte | gate |
+|---|---:|---|
+| closest-hit stream | 0.535 | CPU only: memory-bound |
+| occlusion stream | 0.459 | CPU only: memory-bound |
+| SAH binning + split | 0.250 | CPU only: memory-bound |
+| bounds precompute | 0.300 | CPU only: memory-bound |
+
+Those ratios are measured, not estimated: `bench/instrument.py` inserts a
+counter at every `intersect_box` and `intersect_triangle` call in the shipped
+kernel, `bench/analysis.py` drives it over the benchmark scene (32,768
+triangles, 20,000 rays), and the counted build is asserted bit-for-bit
+identical to the stock export first. Traffic is charged one 64-byte line per
+touched node, triangle and order record, which is the reading most favourable
+to keeping data on the CPU. Rerun with `pixi run analysis`.
+
+The builder is dominated by bounds traffic and random bin updates, while
+traversal has divergent control flow and irregular node and triangle reads. CPU
+traversal is also already ahead of the reference in the benchmark above, so a
+GPU path would add transfer and launch overhead without a justified target.
+
+The shared device was checked anyway, as the phase requires:
+`nvidia-smi --query-gpu=memory.free` reported 5168 MiB free before the work and
+5496 MiB after, both clearing the 4000 MiB floor. No device allocation was made,
+because the intensity gate stops the phase before any GPU code is written.
+Tests that would need a device are therefore not present; the suite is CPU-only
+and ran in full (21 passed, 0 skipped, 0 failed), so nothing was skipped.
