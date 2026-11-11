@@ -57,6 +57,9 @@ def bin_index(center: Float32, offset: Float32, scale: Float32, count: Int) -> I
     return max(0, min(count - 1, index))
 
 
+# Embree: kernels/builders/heuristic_binning.h BinInfoT::bin.
+# Each dimension owns a contiguous run of bin records (lower xyz, then upper
+# xyz), so one bin update touches two cache lines instead of six.
 @always_inline
 def extend_bin(
     bin_bounds: F32Ptr,
@@ -300,15 +303,15 @@ def build_subtree(
         if dz > CENTROID_EPS:
             sz = Float32(0.99) * Float32(num_bins) / dz
 
-        for index in range(num_bins * 3):
+        var bin_slots = num_bins * 3
+        for index in range(bin_slots):
             bin_counts[index] = 0
-            var bb = index * 6
-            bin_bounds[bb] = LARGE
-            bin_bounds[bb + 1] = LARGE
-            bin_bounds[bb + 2] = LARGE
-            bin_bounds[bb + 3] = -LARGE
-            bin_bounds[bb + 4] = -LARGE
-            bin_bounds[bb + 5] = -LARGE
+            bin_bounds[index] = LARGE
+            bin_bounds[bin_slots + index] = LARGE
+            bin_bounds[2 * bin_slots + index] = LARGE
+            bin_bounds[3 * bin_slots + index] = -LARGE
+            bin_bounds[4 * bin_slots + index] = -LARGE
+            bin_bounds[5 * bin_slots + index] = -LARGE
 
         for slot in range(begin, end):
             var primitive = Int(primitive_order[slot])
@@ -335,26 +338,25 @@ def build_subtree(
             var rux = -LARGE
             var ruy = -LARGE
             var ruz = -LARGE
+            var run_bounds = bin_bounds + dim * bin_slots
+            var run_counts = bin_counts + dim * MAX_BINS
             var rcount: Int32 = 0
             var bin = num_bins - 1
             while bin > 0:
-                var index = bin * 3 + dim
-                var bb = index * 6
-                rcount += bin_counts[index]
-                rlx = min(rlx, bin_bounds[bb])
-                rly = min(rly, bin_bounds[bb + 1])
-                rlz = min(rlz, bin_bounds[bb + 2])
-                rux = max(rux, bin_bounds[bb + 3])
-                ruy = max(ruy, bin_bounds[bb + 4])
-                ruz = max(ruz, bin_bounds[bb + 5])
+                rcount += run_counts[bin]
+                rlx = min(rlx, run_bounds[bin])
+                rly = min(rly, run_bounds[bin_slots + bin])
+                rlz = min(rlz, run_bounds[2 * bin_slots + bin])
+                rux = max(rux, run_bounds[3 * bin_slots + bin])
+                ruy = max(ruy, run_bounds[4 * bin_slots + bin])
+                ruz = max(ruz, run_bounds[5 * bin_slots + bin])
                 right_counts[bin] = rcount
-                var rb = bin * 6
-                right_bounds[rb] = rlx
-                right_bounds[rb + 1] = rly
-                right_bounds[rb + 2] = rlz
-                right_bounds[rb + 3] = rux
-                right_bounds[rb + 4] = ruy
-                right_bounds[rb + 5] = ruz
+                right_bounds[bin] = rlx
+                right_bounds[MAX_BINS + bin] = rly
+                right_bounds[2 * MAX_BINS + bin] = rlz
+                right_bounds[3 * MAX_BINS + bin] = rux
+                right_bounds[4 * MAX_BINS + bin] = ruy
+                right_bounds[5 * MAX_BINS + bin] = ruz
                 bin -= 1
 
             var llx = LARGE
@@ -365,27 +367,25 @@ def build_subtree(
             var luz = -LARGE
             var lcount: Int32 = 0
             for split_pos in range(1, num_bins):
-                var index = (split_pos - 1) * 3 + dim
-                var bb = index * 6
-                lcount += bin_counts[index]
-                llx = min(llx, bin_bounds[bb])
-                lly = min(lly, bin_bounds[bb + 1])
-                llz = min(llz, bin_bounds[bb + 2])
-                lux = max(lux, bin_bounds[bb + 3])
-                luy = max(luy, bin_bounds[bb + 4])
-                luz = max(luz, bin_bounds[bb + 5])
-                var rb = split_pos * 6
+                var previous = split_pos - 1
+                lcount += run_counts[previous]
+                llx = min(llx, run_bounds[previous])
+                lly = min(lly, run_bounds[bin_slots + previous])
+                llz = min(llz, run_bounds[2 * bin_slots + previous])
+                lux = max(lux, run_bounds[3 * bin_slots + previous])
+                luy = max(luy, run_bounds[4 * bin_slots + previous])
+                luz = max(luz, run_bounds[5 * bin_slots + previous])
                 var left_blocks = (Int(lcount) + 3) // 4
                 var right_blocks = (Int(right_counts[split_pos]) + 3) // 4
                 var sah = (
                     half_area(llx, lly, llz, lux, luy, luz) * Float32(left_blocks)
                     + half_area(
-                        right_bounds[rb],
-                        right_bounds[rb + 1],
-                        right_bounds[rb + 2],
-                        right_bounds[rb + 3],
-                        right_bounds[rb + 4],
-                        right_bounds[rb + 5],
+                        right_bounds[split_pos],
+                        right_bounds[MAX_BINS + split_pos],
+                        right_bounds[2 * MAX_BINS + split_pos],
+                        right_bounds[3 * MAX_BINS + split_pos],
+                        right_bounds[4 * MAX_BINS + split_pos],
+                        right_bounds[5 * MAX_BINS + split_pos],
                     )
                     * Float32(right_blocks)
                 )
