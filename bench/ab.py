@@ -49,18 +49,6 @@ def timed(call, repeat: int, windows: int) -> float:
     return samples[len(samples) // 10]
 
 
-def serial(fn, workers: int = 1):
-    """Dispatch ``fn`` on the calling thread only, bypassing the thread pool."""
-    import mojo_embree.core as core
-
-    original_workers, original_min = core.MAX_RAY_WORKERS, core.RAY_PARALLEL_MIN
-    core.MAX_RAY_WORKERS, core.RAY_PARALLEL_MIN = workers, 10**9
-    try:
-        return fn()
-    finally:
-        core.MAX_RAY_WORKERS, core.RAY_PARALLEL_MIN = original_workers, original_min
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--save", default=None)
@@ -84,21 +72,15 @@ def main() -> None:
     result["build"] = timed(lambda: BVH(vertices, triangles), 3, 30)
     result["closest_hit"] = timed(lambda: bvh.intersect(origins, directions), 1, 15)
     result["occlusion"] = timed(lambda: bvh.occluded(origins, directions), 1, 15)
-    result["closest_hit_serial"] = timed(
-        lambda: serial(lambda: bvh.intersect(origins, directions), 1), 1, 9
-    )
-    result["occlusion_serial"] = timed(
-        lambda: serial(lambda: bvh.occluded(origins, directions), 1), 1, 9
-    )
 
     small = slice(0, 1_000)
     result["closest_hit_1k"] = timed(
-        lambda: serial(lambda: bvh.intersect(origins[small], directions[small]), 1),
+        lambda: bvh.intersect(origins[small], directions[small]),
         200,
         30,
     )
     result["occlusion_1k"] = timed(
-        lambda: serial(lambda: bvh.occluded(origins[small], directions[small]), 1),
+        lambda: bvh.occluded(origins[small], directions[small]),
         200,
         30,
     )

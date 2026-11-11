@@ -3,6 +3,7 @@
 from std.math import abs, iota
 from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of as simdwidthof
+from max.algorithm import parallelize
 
 comptime F32Ptr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime I32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
@@ -13,6 +14,16 @@ comptime STACK_SIZE = 128
 comptime MAX_WORKERS = 32
 comptime BUILD_PARALLEL_THRESHOLD = 8_192
 comptime BUILD_MAX_WORKERS = 4
+# Parallel thresholds. See bench/analysis.md for the measurements these come
+# from; the serial/parallel A/B runs behind those numbers use the two switches
+# below, which force the matching path to its serial form.
+comptime SERIAL_BUILD = False
+comptime SERIAL_TRAVERSAL = False
+comptime MAX_PARALLEL_WORKERS = 4
+comptime RAY_PARALLEL_MIN = 32_768
+comptime DISABLED = 1 << 62
+comptime BUILD_THRESHOLD = DISABLED if SERIAL_BUILD else BUILD_PARALLEL_THRESHOLD
+comptime RAY_MIN = DISABLED if SERIAL_TRAVERSAL else RAY_PARALLEL_MIN
 comptime LARGE = Float32(3.402823466e38)
 comptime ULP = Float32(1.1920928955078125e-7)
 comptime MIN_RCP_INPUT = Float32(1.0e-18)
@@ -496,7 +507,7 @@ def build_binned_sah(
     node_data[0] = 0
     node_data[1] = Int32(primitive_count)
     var nodes = 1
-    if primitive_count < BUILD_PARALLEL_THRESHOLD:
+    if primitive_count < BUILD_THRESHOLD:
         _ = build_subtree(
             primitive_bounds,
             primitive_count,
@@ -556,12 +567,13 @@ def build_binned_sah(
             Int(node_data[data_base + 1]) - Int(node_data[data_base])
         )
 
-    # The frontier is capped at BUILD_MAX_WORKERS (4) subtrees, and each
-    # task's node region and bin scratch are laid out by index, so the loop
-    # is inlined serially. The compaction pass below is globally sequential
-    # (it renumbers every child reference), which is why this cannot be
-    # lifted to a range-taking entry point either.
-    for task in range(frontier_count):
+    # The frontier is capped at BUILD_MAX_WORKERS (4) subtrees. Each task has
+    # a static node region and its own bin scratch slice, so the four builds
+    # are independent and can run concurrently. They cannot write to the
+    # primitive bounds, the primitive order, or each other's node region, so
+    # the result is bit-identical to the serial loop. The compaction pass
+    # below stays serial because it renumbers every child reference.
+    def build_frontier_task(task: Int) {imm}:
         var stack_offset = 2 * BUILD_MAX_WORKERS
         var node_region = top_node_count
         for previous in range(task):
@@ -588,6 +600,21 @@ def build_binned_sah(
             False,
         )
         right_counts[task * MAX_BINS] = Int32(local_nodes)
+
+    if frontier_count > 1 and MAX_PARALLEL_WORKERS > 1:
+        var build_workers = min(frontier_count, MAX_PARALLEL_WORKERS)
+
+        def build_frontier_chunk(chunk: Int) {imm}:
+            var stop = (frontier_count * (chunk + 1)) // build_workers
+            for task in range(
+                (frontier_count * chunk) // build_workers, stop
+            ):
+                build_frontier_task(task)
+
+        parallelize(build_frontier_chunk, build_workers, build_workers)
+    else:
+        for task in range(frontier_count):
+            build_frontier_task(task)
 
     var compact_node = top_node_count
     var source_node = top_node_count
@@ -911,6 +938,228 @@ def trace_one(
     hit_t[ray_index] = closest
 
 
+def ray_range_start(ray_start: Int, count: Int, chunk: Int, lanes: Int) -> Int:
+    return ray_start + (count * chunk) // lanes
+
+
+def ray_range_stop(ray_start: Int, count: Int, chunk: Int, lanes: Int) -> Int:
+    return ray_start + (count * (chunk + 1)) // lanes
+
+
+def trace_lane(
+    lane: Int,
+    start: Int,
+    stop: Int,
+    row: Int,
+    triangles: F32Ptr,
+    node_bounds: F32Ptr,
+    node_data: I32Ptr,
+    primitive_order: I32Ptr,
+    traversal_stacks: I32Ptr,
+    origins: F32Ptr,
+    directions: F32Ptr,
+    ray_nears: F32Ptr,
+    ray_fars: F32Ptr,
+    hit_ids: I32Ptr,
+    hit_t: F32Ptr,
+    hit_u: F32Ptr,
+    hit_v: F32Ptr,
+    hit_ng: F32Ptr,
+    primitive_count: Int,
+):
+    _ = lane
+    trace_range(
+        triangles,
+        node_bounds,
+        node_data,
+        primitive_order,
+        traversal_stacks,
+        origins,
+        directions,
+        ray_nears,
+        ray_fars,
+        hit_ids,
+        hit_t,
+        hit_u,
+        hit_v,
+        hit_ng,
+        primitive_count,
+        start,
+        stop,
+        row,
+    )
+
+
+def occlusion_lane(
+    lane: Int,
+    start: Int,
+    stop: Int,
+    row: Int,
+    triangles: F32Ptr,
+    node_bounds: F32Ptr,
+    node_data: I32Ptr,
+    primitive_order: I32Ptr,
+    traversal_stacks: I32Ptr,
+    origins: F32Ptr,
+    directions: F32Ptr,
+    ray_nears: F32Ptr,
+    ray_fars: F32Ptr,
+    occluded: U8Ptr,
+    primitive_count: Int,
+):
+    _ = lane
+    occluded_range(
+        triangles,
+        node_bounds,
+        node_data,
+        primitive_order,
+        traversal_stacks,
+        origins,
+        directions,
+        ray_nears,
+        ray_fars,
+        occluded,
+        primitive_count,
+        start,
+        stop,
+        row,
+    )
+
+
+def parallel_trace(
+    count: Int,
+    ray_start: Int,
+    stack_rows: Int,
+    triangles: F32Ptr,
+    node_bounds: F32Ptr,
+    node_data: I32Ptr,
+    primitive_order: I32Ptr,
+    traversal_stacks: I32Ptr,
+    origins: F32Ptr,
+    directions: F32Ptr,
+    ray_nears: F32Ptr,
+    ray_fars: F32Ptr,
+    hit_ids: I32Ptr,
+    hit_t: F32Ptr,
+    hit_u: F32Ptr,
+    hit_v: F32Ptr,
+    hit_ng: F32Ptr,
+    primitive_count: Int,
+):
+    var lanes = min(count, MAX_PARALLEL_WORKERS)
+
+    # Only a top-level function can fan out: a closure here delivers garbage
+    # for captured parameter values (ray_stop arrived as 1.0e14), and a
+    # multi-argument worker is rejected by parallelize. With no captures left,
+    # the range is derived from the worker index alone.
+    def worker(lane: Int) {imm}:
+        trace_lane(
+            lane,
+            ray_start + (count * lane) // lanes,
+            ray_start + (count * (lane + 1)) // lanes,
+            min(lane, stack_rows - 1),
+            triangles,
+            node_bounds,
+            node_data,
+            primitive_order,
+            traversal_stacks,
+            origins,
+            directions,
+            ray_nears,
+            ray_fars,
+            hit_ids,
+            hit_t,
+            hit_u,
+            hit_v,
+            hit_ng,
+            primitive_count,
+        )
+
+    parallelize(worker, lanes, lanes)
+
+
+def parallel_occluded(
+    count: Int,
+    ray_start: Int,
+    stack_rows: Int,
+    triangles: F32Ptr,
+    node_bounds: F32Ptr,
+    node_data: I32Ptr,
+    primitive_order: I32Ptr,
+    traversal_stacks: I32Ptr,
+    origins: F32Ptr,
+    directions: F32Ptr,
+    ray_nears: F32Ptr,
+    ray_fars: F32Ptr,
+    occluded: U8Ptr,
+    primitive_count: Int,
+):
+    var lanes = min(count, MAX_PARALLEL_WORKERS)
+
+    def worker(lane: Int) {imm}:
+        occlusion_lane(
+            lane,
+            ray_start + (count * lane) // lanes,
+            ray_start + (count * (lane + 1)) // lanes,
+            min(lane, stack_rows - 1),
+            triangles,
+            node_bounds,
+            node_data,
+            primitive_order,
+            traversal_stacks,
+            origins,
+            directions,
+            ray_nears,
+            ray_fars,
+            occluded,
+            primitive_count,
+        )
+
+    parallelize(worker, lanes, lanes)
+
+
+def trace_range(
+    triangles: F32Ptr,
+    node_bounds: F32Ptr,
+    node_data: I32Ptr,
+    primitive_order: I32Ptr,
+    traversal_stacks: I32Ptr,
+    origins: F32Ptr,
+    directions: F32Ptr,
+    ray_nears: F32Ptr,
+    ray_fars: F32Ptr,
+    hit_ids: I32Ptr,
+    hit_t: F32Ptr,
+    hit_u: F32Ptr,
+    hit_v: F32Ptr,
+    hit_ng: F32Ptr,
+    primitive_count: Int,
+    ray_start: Int,
+    ray_stop: Int,
+    stack_row: Int,
+):
+    var stack = traversal_stacks + stack_row * STACK_SIZE
+    for ray in range(ray_start, ray_stop):
+        trace_one(
+            triangles,
+            node_bounds,
+            node_data,
+            primitive_order,
+            stack,
+            origins,
+            directions,
+            ray_nears,
+            ray_fars,
+            hit_ids,
+            hit_t,
+            hit_u,
+            hit_v,
+            hit_ng,
+            primitive_count,
+            ray,
+        )
+
+
 # Embree: kernels/bvh/bvh_intersector1.cpp BVHNIntersector1::occluded.
 def occluded_one(
     triangles: F32Ptr,
@@ -991,6 +1240,40 @@ def occluded_one(
             stack_size += 2
 
 
+def occluded_range(
+    triangles: F32Ptr,
+    node_bounds: F32Ptr,
+    node_data: I32Ptr,
+    primitive_order: I32Ptr,
+    traversal_stacks: I32Ptr,
+    origins: F32Ptr,
+    directions: F32Ptr,
+    ray_nears: F32Ptr,
+    ray_fars: F32Ptr,
+    occluded: U8Ptr,
+    primitive_count: Int,
+    ray_start: Int,
+    ray_stop: Int,
+    stack_row: Int,
+):
+    var stack = traversal_stacks + stack_row * STACK_SIZE
+    for ray in range(ray_start, ray_stop):
+        occluded_one(
+            triangles,
+            node_bounds,
+            node_data,
+            primitive_order,
+            stack,
+            origins,
+            directions,
+            ray_nears,
+            ray_fars,
+            occluded,
+            primitive_count,
+            ray,
+        )
+
+
 @export("me_build_bvh")
 def me_build_bvh(
     triangles_address: Int,
@@ -1040,6 +1323,7 @@ def me_intersect_stream(
     primitive_count: Int,
     ray_start: Int,
     ray_stop: Int,
+    traversal_stack_count: Int = 1,
 ) abi("C"):
     initialize_runtime()
     if ray_stop <= ray_start:
@@ -1058,14 +1342,19 @@ def me_intersect_stream(
     var hit_v = fp(hit_v_address)
     var hit_ng = fp(hit_ng_address)
     var traversal_stacks = ip(traversal_stacks_address)
+    var count = ray_stop - ray_start
+
     # Each ray is an independent latency-bound walk down the BVH: O(log N)
     # node tests plus a few triangle tests, all random accesses with no
     # prefetching, so a single core runs out of outstanding misses long
-    # before it saturates memory. The shim fans this out over a thread pool
-    # and hands each chunk its own traversal stack, so this entry point
-    # covers the ray range [ray_start, ray_stop).
-    for ray in range(ray_start, ray_stop):
-        trace_one(
+    # before it saturates memory. Above the measured threshold the range is
+    # split into disjoint index ranges, one per worker, and every worker gets
+    # its own traversal stack row. Each range walks the same rays in the same
+    # order through the same kernel, so the output is identical to the serial
+    # walk. A capturing closure here miscompiles the pointer arguments, so the
+    # shared work is a top-level function and the worker only passes it values.
+    if count < RAY_MIN or count < 2:
+        trace_range(
             triangles,
             node_bounds,
             node_data,
@@ -1081,7 +1370,30 @@ def me_intersect_stream(
             hit_v,
             hit_ng,
             primitive_count,
-            ray,
+            ray_start,
+            ray_stop,
+            0,
+        )
+    else:
+        parallel_trace(
+            count,
+            ray_start,
+            traversal_stack_count,
+            triangles,
+            node_bounds,
+            node_data,
+            primitive_order,
+            traversal_stacks,
+            origins,
+            directions,
+            ray_nears,
+            ray_fars,
+            hit_ids,
+            hit_t,
+            hit_u,
+            hit_v,
+            hit_ng,
+            primitive_count,
         )
 
 
@@ -1100,6 +1412,7 @@ def me_occluded_stream(
     primitive_count: Int,
     ray_start: Int,
     ray_stop: Int,
+    traversal_stack_count: Int = 1,
 ) abi("C"):
     initialize_runtime()
     if ray_stop <= ray_start:
@@ -1114,11 +1427,12 @@ def me_occluded_stream(
     var ray_fars = fp(ray_fars_address)
     var result = bp(occluded_address)
     var traversal_stacks = ip(traversal_stacks_address)
-    # Independent any-hit walks, so the same reasoning as me_intersect_stream
-    # applies: the shim splits the ray range and gives each chunk its own
-    # traversal stack.
-    for ray in range(ray_start, ray_stop):
-        occluded_one(
+    var count = ray_stop - ray_start
+
+    # Independent any-hit walks, so the same reasoning and the same
+    # serial/parallel split as me_intersect_stream applies.
+    if count < RAY_MIN or count < 2:
+        occluded_range(
             triangles,
             node_bounds,
             node_data,
@@ -1130,7 +1444,26 @@ def me_occluded_stream(
             ray_fars,
             result,
             primitive_count,
-            ray,
+            ray_start,
+            ray_stop,
+            0,
+        )
+    else:
+        parallel_occluded(
+            count,
+            ray_start,
+            traversal_stack_count,
+            triangles,
+            node_bounds,
+            node_data,
+            primitive_order,
+            traversal_stacks,
+            origins,
+            directions,
+            ray_nears,
+            ray_fars,
+            result,
+            primitive_count,
         )
 
 
